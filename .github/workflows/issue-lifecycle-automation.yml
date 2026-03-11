@@ -19,6 +19,11 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  TARGET_BASE_BRANCH: Integration
+
+concurrency:
+  group: issue-lifecycle-${{ github.event.issue.number || github.event.inputs.issue_number || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   bootstrap-from-issue:
@@ -88,25 +93,31 @@ jobs:
 
             core.setOutput("number", String(issue.number));
             core.setOutput("title", issue.title);
+            core.setOutput("body", issue.body || "");
+            core.setOutput("url", issue.html_url);
             core.setOutput("branch", branch);
             core.setOutput("labels", labels);
 
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          ref: main
+          ref: ${{ env.TARGET_BASE_BRANCH }}
+          fetch-depth: 0
 
       - name: Create or reuse working branch
         run: |
           BRANCH="${{ steps.issue.outputs.branch }}"
+          BASE="${{ env.TARGET_BASE_BRANCH }}"
+
           if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
             git fetch origin "$BRANCH"
             git checkout -B "$BRANCH" "origin/$BRANCH"
           else
-            git checkout -b "$BRANCH"
+            git fetch origin "$BASE"
+            git checkout -b "$BRANCH" "origin/$BASE"
           fi
 
-      - name: Apply issue bootstrap actions
+      - name: Apply deterministic bootstrap actions
         run: |
           chmod +x .github/scripts/bootstrap_issue.sh
           ./.github/scripts/bootstrap_issue.sh \
@@ -114,18 +125,55 @@ jobs:
             "${{ steps.issue.outputs.title }}" \
             "${{ steps.issue.outputs.labels }}"
 
+      - name: Validate OPENAI_API_KEY secret
+        if: ${{ secrets.OPENAI_API_KEY == '' }}
+        run: |
+          echo "::error::Missing repository secret OPENAI_API_KEY. Configure it at Settings -> Secrets and variables -> Actions."
+          exit 1
+
+      - name: Generate implementation with Codex
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          sandbox: workspace-write
+          prompt: |
+            You are Codex running in GitHub Actions.
+
+            Repository: ${{ github.repository }}
+            Base branch: ${{ env.TARGET_BASE_BRANCH }}
+            Working branch: ${{ steps.issue.outputs.branch }}
+            Issue: #${{ steps.issue.outputs.number }}
+            Issue URL: ${{ steps.issue.outputs.url }}
+            Issue labels: ${{ steps.issue.outputs.labels }}
+            Issue title: ${{ steps.issue.outputs.title }}
+
+            Issue description:
+            ---
+            ${{ steps.issue.outputs.body }}
+            ---
+
+            Requirements:
+            - Read AGENTS.md and follow repository conventions.
+            - Implement the issue in code and docs as needed.
+            - Keep changes minimal, production-safe, and deterministic.
+            - Add/update tests when behavior changes.
+            - Run lightweight validation commands where possible.
+            - If the issue cannot be fully completed safely, leave clear TODO markers and explain the exact blocker.
+
       - name: Commit and push changes
         run: |
           BRANCH="${{ steps.issue.outputs.branch }}"
           ISSUE_NUMBER="${{ steps.issue.outputs.number }}"
+          BASE="${{ env.TARGET_BASE_BRANCH }}"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
-            git commit -m "feat: automated bootstrap for issue #$ISSUE_NUMBER"
-          elif [[ "$(git rev-list --count origin/main..HEAD)" == "0" ]]; then
+            git commit -m "feat: codex implementation for issue #$ISSUE_NUMBER"
+          elif [[ "$(git rev-list --count origin/$BASE..HEAD)" == "0" ]]; then
             git commit --allow-empty -m "chore: initialize issue branch #$ISSUE_NUMBER"
           fi
 
@@ -138,6 +186,8 @@ jobs:
           BRANCH: ${{ steps.issue.outputs.branch }}
           ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
           ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+          TARGET_BASE_BRANCH: ${{ env.TARGET_BASE_BRANCH }}
+          CODEX_SUMMARY: ${{ steps.codex.outputs.final-message }}
         with:
           script: |
             try {
@@ -151,21 +201,28 @@ jobs:
                 head
               });
 
-              let pr = existing[0];
+              let pr = existing.find((pull) => pull.base.ref === process.env.TARGET_BASE_BRANCH);
               if (!pr) {
+                const codexSummary = (process.env.CODEX_SUMMARY || "").trim().slice(0, 5000);
+                const body = [
+                  "## Automated Issue Workflow (Codex)",
+                  `- Source issue: #${process.env.ISSUE_NUMBER}`,
+                  `- Working branch: \`${process.env.BRANCH}\``,
+                  `- Target branch: \`${process.env.TARGET_BASE_BRANCH}\``,
+                  "",
+                  "### Codex Run Summary",
+                  codexSummary || "_No summary returned by Codex_",
+                  "",
+                  `Closes #${process.env.ISSUE_NUMBER}`
+                ].join("\n");
+
                 const created = await github.rest.pulls.create({
                   owner,
                   repo,
-                  base: "main",
+                  base: process.env.TARGET_BASE_BRANCH,
                   head: process.env.BRANCH,
                   title: `feat(issue #${process.env.ISSUE_NUMBER}): ${process.env.ISSUE_TITLE}`,
-                  body: [
-                    "## Automated Issue Workflow",
-                    `- Source issue: #${process.env.ISSUE_NUMBER}`,
-                    `- Working branch: \`${process.env.BRANCH}\``,
-                    "",
-                    `Closes #${process.env.ISSUE_NUMBER}`
-                  ].join("\n")
+                  body
                 });
                 pr = created.data;
               }
@@ -178,8 +235,9 @@ jobs:
                 core.setFailed(
                   [
                     "GitHub policy blocked PR creation with GITHUB_TOKEN.",
-                    "Enable this in repository settings:",
-                    "Settings -> Actions -> General -> Workflow permissions -> Allow GitHub Actions to create and approve pull requests."
+                    "Enable repository settings:",
+                    "Settings -> Actions -> General -> Workflow permissions -> Read and write permissions",
+                    "Settings -> Actions -> General -> Workflow permissions -> Allow GitHub Actions to create and approve pull requests"
                   ].join(" ")
                 );
                 return;
@@ -188,13 +246,74 @@ jobs:
               throw error;
             }
 
-      - name: Post issue status comment
+      - name: Attempt automatic merge into Integration
+        id: merge
+        uses: actions/github-script@v8
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pull_number = Number(process.env.PR_NUMBER);
+            if (!pull_number) {
+              core.setOutput("merged", "false");
+              core.setOutput("reason", "No PR number available.");
+              return;
+            }
+
+            try {
+              await github.rest.pulls.merge({
+                owner,
+                repo,
+                pull_number,
+                merge_method: "squash"
+              });
+              core.setOutput("merged", "true");
+              core.setOutput("reason", "Merged successfully.");
+            } catch (error) {
+              core.setOutput("merged", "false");
+              core.setOutput("reason", String(error?.message || error));
+            }
+
+      - name: Close issue after successful auto-merge
+        if: steps.merge.outputs.merged == 'true'
+        uses: actions/github-script@v8
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          TARGET_BASE_BRANCH: ${{ env.TARGET_BASE_BRANCH }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = Number(process.env.ISSUE_NUMBER);
+
+            await github.rest.issues.update({
+              owner,
+              repo,
+              issue_number,
+              state: "closed"
+            });
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body: [
+                `Codex completed implementation and merged PR #${process.env.PR_NUMBER} into \`${process.env.TARGET_BASE_BRANCH}\`.`,
+                "Issue has been closed automatically."
+              ].join("\n")
+            });
+
+      - name: Post issue status when auto-merge is pending
+        if: steps.merge.outputs.merged != 'true'
         uses: actions/github-script@v8
         env:
           ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
           BRANCH: ${{ steps.issue.outputs.branch }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           PR_URL: ${{ steps.pr.outputs.url }}
+          TARGET_BASE_BRANCH: ${{ env.TARGET_BASE_BRANCH }}
+          MERGE_REASON: ${{ steps.merge.outputs.reason }}
         with:
           script: |
             const { owner, repo } = context.repo;
@@ -205,11 +324,15 @@ jobs:
               repo,
               issue_number,
               body: [
-                "Automation completed:",
-                `- Branch created: \`${process.env.BRANCH}\``,
-                `- PR ready: #${process.env.PR_NUMBER} (${process.env.PR_URL})`,
+                "Codex automation completed branch + PR creation:",
+                `- Branch: \`${process.env.BRANCH}\``,
+                `- PR: #${process.env.PR_NUMBER} (${process.env.PR_URL})`,
+                `- Target branch: \`${process.env.TARGET_BASE_BRANCH}\``,
                 "",
-                "When implementation is complete, comment `/done` on this issue to merge the PR into `main` and close the issue."
+                "Automatic merge is currently pending or blocked.",
+                `Reason: ${process.env.MERGE_REASON}`,
+                "",
+                "After resolving checks/conflicts, comment `/done` on this issue to merge and close."
               ].join("\n")
             });
 
@@ -221,8 +344,10 @@ jobs:
       startsWith(github.event.comment.body, '/done')
     runs-on: ubuntu-latest
     steps:
-      - name: Merge PR and close issue
+      - name: Merge PR and close issue on /done
         uses: actions/github-script@v8
+        env:
+          TARGET_BASE_BRANCH: ${{ env.TARGET_BASE_BRANCH }}
         with:
           script: |
             const association = context.payload.comment.author_association;
@@ -258,7 +383,8 @@ jobs:
 
             const linkedPull = pulls.find((pull) => {
               const body = (pull.body || "").toLowerCase();
-              return issueRefs.some((ref) => body.includes(ref));
+              return pull.base.ref === process.env.TARGET_BASE_BRANCH &&
+                issueRefs.some((ref) => body.includes(ref));
             });
 
             if (!linkedPull) {
@@ -266,7 +392,7 @@ jobs:
                 owner,
                 repo,
                 issue_number: issueNumber,
-                body: "No open PR linked to this issue was found. Merge skipped."
+                body: `No open PR linked to this issue targeting \`${process.env.TARGET_BASE_BRANCH}\` was found. Merge skipped.`
               });
               return;
             }
@@ -289,5 +415,5 @@ jobs:
               owner,
               repo,
               issue_number: issueNumber,
-              body: `Merged PR #${linkedPull.number} into \`main\` and closed this issue.`
+              body: `Merged PR #${linkedPull.number} into \`${process.env.TARGET_BASE_BRANCH}\` and closed this issue.`
             });

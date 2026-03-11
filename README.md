@@ -4,12 +4,16 @@
 
 This repository includes automated issue lifecycle handling via GitHub Actions:
 
-1. When an issue is opened/reopened, a branch is created as `issue/<number>-<slug>`.
-2. A bootstrap script runs for setup-related tickets (for example issue `#1` style project initialization).
-3. A PR to `main` is created automatically and linked with `Closes #<issue>`.
-4. When a repository collaborator comments `/done` on the issue, the linked PR is squashed into `main` and the issue is closed.
-5. For already-open issues, run the workflow manually with `issue_number` using `workflow_dispatch`.
-6. Alternative for already-open issues: comment `/bootstrap` on that issue to start automation without using the manual input box.
+1. On `issues.opened/reopened`, a feature branch is created as `issue/<number>-<slug>` from `Integration`.
+2. Codex runs in CI (`openai/codex-action`) using issue title/body as implementation input.
+3. Changes are committed and a PR targeting `Integration` is created automatically.
+4. Workflow attempts automatic squash merge into `Integration`.
+5. If automatic merge succeeds, issue is closed automatically.
+6. If merge is blocked by protections/checks/conflicts, workflow comments status and a collaborator can finalize with `/done`.
+
+For already-open issues:
+- Run workflow manually with `issue_number` (`workflow_dispatch`).
+- Or comment `/bootstrap` on that issue.
 
 Workflow file:
 - `.github/workflows/issue-lifecycle-automation.yml`
@@ -17,3 +21,6 @@ Workflow file:
 Prerequisite repository setting:
 - `Settings -> Actions -> General -> Workflow permissions -> Read and write permissions`
 - `Settings -> Actions -> General -> Workflow permissions -> Allow GitHub Actions to create and approve pull requests`
+
+Required secret:
+- `Settings -> Secrets and variables -> Actions -> OPENAI_API_KEY`
