@@ -92,7 +92,7 @@ jobs:
             core.setOutput("labels", labels);
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: main
 
@@ -140,37 +140,53 @@ jobs:
           ISSUE_TITLE: ${{ steps.issue.outputs.title }}
         with:
           script: |
-            const { owner, repo } = context.repo;
-            const head = `${owner}:${process.env.BRANCH}`;
+            try {
+              const { owner, repo } = context.repo;
+              const head = `${owner}:${process.env.BRANCH}`;
 
-            const existing = await github.paginate(github.rest.pulls.list, {
-              owner,
-              repo,
-              state: "open",
-              head
-            });
-
-            let pr = existing[0];
-            if (!pr) {
-              const created = await github.rest.pulls.create({
+              const existing = await github.paginate(github.rest.pulls.list, {
                 owner,
                 repo,
-                base: "main",
-                head: process.env.BRANCH,
-                title: `feat(issue #${process.env.ISSUE_NUMBER}): ${process.env.ISSUE_TITLE}`,
-                body: [
-                  "## Automated Issue Workflow",
-                  `- Source issue: #${process.env.ISSUE_NUMBER}`,
-                  `- Working branch: \`${process.env.BRANCH}\``,
-                  "",
-                  `Closes #${process.env.ISSUE_NUMBER}`
-                ].join("\n")
+                state: "open",
+                head
               });
-              pr = created.data;
-            }
 
-            core.setOutput("number", String(pr.number));
-            core.setOutput("url", pr.html_url);
+              let pr = existing[0];
+              if (!pr) {
+                const created = await github.rest.pulls.create({
+                  owner,
+                  repo,
+                  base: "main",
+                  head: process.env.BRANCH,
+                  title: `feat(issue #${process.env.ISSUE_NUMBER}): ${process.env.ISSUE_TITLE}`,
+                  body: [
+                    "## Automated Issue Workflow",
+                    `- Source issue: #${process.env.ISSUE_NUMBER}`,
+                    `- Working branch: \`${process.env.BRANCH}\``,
+                    "",
+                    `Closes #${process.env.ISSUE_NUMBER}`
+                  ].join("\n")
+                });
+                pr = created.data;
+              }
+
+              core.setOutput("number", String(pr.number));
+              core.setOutput("url", pr.html_url);
+            } catch (error) {
+              const message = String(error?.message || error);
+              if (message.includes("not permitted to create or approve pull requests")) {
+                core.setFailed(
+                  [
+                    "GitHub policy blocked PR creation with GITHUB_TOKEN.",
+                    "Enable this in repository settings:",
+                    "Settings -> Actions -> General -> Workflow permissions -> Allow GitHub Actions to create and approve pull requests."
+                  ].join(" ")
+                );
+                return;
+              }
+
+              throw error;
+            }
 
       - name: Post issue status comment
         uses: actions/github-script@v8

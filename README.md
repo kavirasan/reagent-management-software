@@ -13,3 +13,7 @@ This repository includes automated issue lifecycle handling via GitHub Actions:
 
 Workflow file:
 - `.github/workflows/issue-lifecycle-automation.yml`
+
+Prerequisite repository setting:
+- `Settings -> Actions -> General -> Workflow permissions -> Read and write permissions`
+- `Settings -> Actions -> General -> Workflow permissions -> Allow GitHub Actions to create and approve pull requests`
