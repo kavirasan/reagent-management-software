@@ -17,6 +17,9 @@ permissions:
   pull-requests: write
   issues: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   bootstrap-from-issue:
     if: github.event_name == 'issues' || github.event_name == 'workflow_dispatch'
@@ -24,14 +27,25 @@ jobs:
     steps:
       - name: Compute issue variables
         id: issue
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const { owner, repo } = context.repo;
             let issue;
 
             if (context.eventName === "workflow_dispatch") {
-              const issueNumber = Number(core.getInput("issue_number", { required: true }));
+              const rawIssueNumber = core.getInput("issue_number").trim();
+              if (!rawIssueNumber) {
+                core.setFailed("Missing required input: issue_number. Provide an existing issue number when running workflow_dispatch.");
+                return;
+              }
+
+              const issueNumber = Number(rawIssueNumber);
+              if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+                core.setFailed(`Invalid issue_number '${rawIssueNumber}'. Use a positive integer.`);
+                return;
+              }
+
               const response = await github.rest.issues.get({
                 owner,
                 repo,
@@ -97,7 +111,7 @@ jobs:
 
       - name: Create or reuse pull request
         id: pr
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           BRANCH: ${{ steps.issue.outputs.branch }}
           ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
@@ -137,7 +151,7 @@ jobs:
             core.setOutput("url", pr.html_url);
 
       - name: Post issue status comment
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
           BRANCH: ${{ steps.issue.outputs.branch }}
@@ -170,7 +184,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Merge PR and close issue
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const association = context.payload.comment.author_association;
