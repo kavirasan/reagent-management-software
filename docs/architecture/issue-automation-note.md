@@ -31,6 +31,7 @@ Primary user goal:
 Critical:
 - `issues.opened` and `issues.reopened` events to create/reuse branch and bootstrap implementation.
 - `workflow_dispatch` with `issue_number` to bootstrap existing open issues.
+- `issue_comment.created` with `/bootstrap` to bootstrap a specific existing issue without manual workflow input.
 - `pulls.create` API to open a PR linked to issue.
 - `issue_comment.created` with `/done` command to merge PR and close issue.
 - `pulls.merge` and `issues.update(state=closed)` APIs for completion.

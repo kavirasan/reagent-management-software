@@ -22,9 +22,31 @@ env:
 
 jobs:
   bootstrap-from-issue:
-    if: github.event_name == 'issues' || github.event_name == 'workflow_dispatch'
+    if: >
+      github.event_name == 'issues' ||
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.action == 'created' &&
+        !github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/bootstrap')
+      )
     runs-on: ubuntu-latest
     steps:
+      - name: Authorize bootstrap command commenter
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const association = context.payload.comment.author_association;
+            const allowed = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+            if (!allowed.has(association)) {
+              core.setFailed(
+                `Only repository collaborators can run /bootstrap. Received association: ${association}`
+              );
+              return;
+            }
+
       - name: Compute issue variables
         id: issue
         uses: actions/github-script@v8
