@@ -1,0 +1,241 @@
+name: Issue Lifecycle Automation
+
+on:
+  issues:
+    types: [opened, reopened]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Existing issue number to bootstrap"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  bootstrap-from-issue:
+    if: github.event_name == 'issues' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute issue variables
+        id: issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            let issue;
+
+            if (context.eventName === "workflow_dispatch") {
+              const issueNumber = Number(core.getInput("issue_number", { required: true }));
+              const response = await github.rest.issues.get({
+                owner,
+                repo,
+                issue_number: issueNumber
+              });
+              issue = response.data;
+            } else {
+              issue = context.payload.issue;
+            }
+
+            const slug = issue.title
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, "-")
+              .replace(/(^-|-$)/g, "")
+              .slice(0, 48);
+            const branch = `issue/${issue.number}-${slug || "work-item"}`;
+            const labels = issue.labels.map((label) => label.name).join(",");
+
+            core.setOutput("number", String(issue.number));
+            core.setOutput("title", issue.title);
+            core.setOutput("branch", branch);
+            core.setOutput("labels", labels);
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Create or reuse working branch
+        run: |
+          BRANCH="${{ steps.issue.outputs.branch }}"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH"
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            git checkout -b "$BRANCH"
+          fi
+
+      - name: Apply issue bootstrap actions
+        run: |
+          chmod +x .github/scripts/bootstrap_issue.sh
+          ./.github/scripts/bootstrap_issue.sh \
+            "${{ steps.issue.outputs.number }}" \
+            "${{ steps.issue.outputs.title }}" \
+            "${{ steps.issue.outputs.labels }}"
+
+      - name: Commit and push changes
+        run: |
+          BRANCH="${{ steps.issue.outputs.branch }}"
+          ISSUE_NUMBER="${{ steps.issue.outputs.number }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "feat: automated bootstrap for issue #$ISSUE_NUMBER"
+          elif [[ "$(git rev-list --count origin/main..HEAD)" == "0" ]]; then
+            git commit --allow-empty -m "chore: initialize issue branch #$ISSUE_NUMBER"
+          fi
+
+          git push --set-upstream origin "$BRANCH"
+
+      - name: Create or reuse pull request
+        id: pr
+        uses: actions/github-script@v7
+        env:
+          BRANCH: ${{ steps.issue.outputs.branch }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const head = `${owner}:${process.env.BRANCH}`;
+
+            const existing = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: "open",
+              head
+            });
+
+            let pr = existing[0];
+            if (!pr) {
+              const created = await github.rest.pulls.create({
+                owner,
+                repo,
+                base: "main",
+                head: process.env.BRANCH,
+                title: `feat(issue #${process.env.ISSUE_NUMBER}): ${process.env.ISSUE_TITLE}`,
+                body: [
+                  "## Automated Issue Workflow",
+                  `- Source issue: #${process.env.ISSUE_NUMBER}`,
+                  `- Working branch: \`${process.env.BRANCH}\``,
+                  "",
+                  `Closes #${process.env.ISSUE_NUMBER}`
+                ].join("\n")
+              });
+              pr = created.data;
+            }
+
+            core.setOutput("number", String(pr.number));
+            core.setOutput("url", pr.html_url);
+
+      - name: Post issue status comment
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          BRANCH: ${{ steps.issue.outputs.branch }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = Number(process.env.ISSUE_NUMBER);
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body: [
+                "Automation completed:",
+                `- Branch created: \`${process.env.BRANCH}\``,
+                `- PR ready: #${process.env.PR_NUMBER} (${process.env.PR_URL})`,
+                "",
+                "When implementation is complete, comment `/done` on this issue to merge the PR into `main` and close the issue."
+              ].join("\n")
+            });
+
+  merge-and-close-on-done:
+    if: >
+      github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      !github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/done')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge PR and close issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const association = context.payload.comment.author_association;
+            const allowed = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+            if (!allowed.has(association)) {
+              core.setFailed(
+                `Only repository collaborators can run /done. Received association: ${association}`
+              );
+              return;
+            }
+
+            const { owner, repo } = context.repo;
+            const issueNumber = context.payload.issue.number;
+
+            const issueRefs = [
+              `closes #${issueNumber}`,
+              `close #${issueNumber}`,
+              `closed #${issueNumber}`,
+              `fixes #${issueNumber}`,
+              `fix #${issueNumber}`,
+              `fixed #${issueNumber}`,
+              `resolves #${issueNumber}`,
+              `resolve #${issueNumber}`,
+              `resolved #${issueNumber}`
+            ];
+
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: "open",
+              per_page: 100
+            });
+
+            const linkedPull = pulls.find((pull) => {
+              const body = (pull.body || "").toLowerCase();
+              return issueRefs.some((ref) => body.includes(ref));
+            });
+
+            if (!linkedPull) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                body: "No open PR linked to this issue was found. Merge skipped."
+              });
+              return;
+            }
+
+            await github.rest.pulls.merge({
+              owner,
+              repo,
+              pull_number: linkedPull.number,
+              merge_method: "squash"
+            });
+
+            await github.rest.issues.update({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              state: "closed"
+            });
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body: `Merged PR #${linkedPull.number} into \`main\` and closed this issue.`
+            });
