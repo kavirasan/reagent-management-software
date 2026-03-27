@@ -11,6 +11,11 @@ on:
         description: "Existing issue number to bootstrap"
         required: true
         type: string
+      base_branch:
+        description: "Base branch to create the issue branch from (default: main)"
+        required: false
+        default: "main"
+        type: string
 
 permissions:
   contents: write
@@ -94,7 +99,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.base_branch || 'main' }}
 
       - name: Create or reuse working branch
         run: |
@@ -138,6 +143,7 @@ jobs:
           BRANCH: ${{ steps.issue.outputs.branch }}
           ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
           ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+          BASE_BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.base_branch || 'main' }}
         with:
           script: |
             const { owner, repo } = context.repo;
@@ -155,7 +161,7 @@ jobs:
               const created = await github.rest.pulls.create({
                 owner,
                 repo,
-                base: "main",
+                base: process.env.BASE_BRANCH || "main",
                 head: process.env.BRANCH,
                 title: `feat(issue #${process.env.ISSUE_NUMBER}): ${process.env.ISSUE_TITLE}`,
                 body: [
